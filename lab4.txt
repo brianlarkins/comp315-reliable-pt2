@@ -1,0 +1,277 @@
+COMP 315
+Lab 4 - Reliable Transport Protocols – Redux
+
+[image]
+
+In this project, you will implement six C functions that provide a
+reliable sliding window transport layer over an unreliable network
+layer. Work submitted after the deadline will receive no credit. Submit
+this by logging into cslogin.arc.rhodes.edu and changing to the comp315
+directory in your home directory. Inside of comp315, follow the
+instructions from the Github Assignment Link to clone the template
+repository.
+Your programs must compile and run on a Linux system. You should be fine
+to develop these on a Mac or Windows Subsystem for Linux, but you need
+to ensure that they execute correctly under Linux (i.e. I will grade on
+Linux).
+
+There is skeleton starter code in /home/comp315/lab4 on cslogin, as well
+as a reference implementations of the server to test with.
+
+Overview
+
+For this project, you will be implementing a sliding window reliable
+transport layer on top of the User Datagram Protocol (UDP), which is
+unreliable. Your implementation should handle corrupted packets,
+rudimentary flow control, and recover from lost or dropped packets. The
+application should perceive the network connection as a stream-based,
+connection-oriented system.
+
+For this assignment, your implementation should operate in a
+single-connection mode. Your program will take a window size, local UDP
+port, remote hostname, and remote port as parameters. Any data read from
+standard input will be transmitted to the remote host, and any data
+received over the reliable connection will be displayed on standard
+output. Your program will support two-way (i.e. full duplex),
+asynchronous communication. Each process will read data from standard
+input until an end-of-file (EOF) is reached, break the data into
+fixed-sized packets with a transport-layer header, and transmit the data
+to the receiving process. The receiver will read these packets and write
+the data to standard output.
+
+Implementation
+
+This project consists of three files, reliable.c, rlib.c, and  rlib.h.
+The implementation of the network layer is contained in  rlib.c, with
+the interface documented in rlib.h. You should clearly understand the
+interface and be familiar with the implementation prior of the network
+layer functions prior to starting the assignment. This assignment has
+been adapted from a framework developed at Stanford University and used
+in their networking courses. The rlib.c and rlib.h files are unchanged
+from the previous assignment.
+
+This assignment will require the use of both send and receive buffers to
+store out-of-order packets and to maintain data for retransmission, if
+needed. The window buffer data structure is used for both send and
+receive buffers and has the following structure:
+
+         struct window_buf_s {
+               uint32_t        len;       // packet length
+               uint32_t        valid;     // this buffer contains a received packet (recv-only)
+               uint32_t        ack;       // this buffer has been acknowledeged by receiver (send-only)
+               uint64_t        timestamp; // when this packet was sent (send-only)
+               packet_t        p;         // buffered packet
+          };
+          typedef struct window_buf_s window_buf_t;
+
+- len: total length of the packet. Should be 8 for acknowledgements and
+  12 + payload for data packets. A packet with a zero-length payload
+  signifies an end-of-file condition.
+
+- valid: zero if this buffer entry is unused, and one if it contains a
+  packet that has been received (potentially out-of-order). This is set
+  when the packet is received. The longest contiguous sequence of valid
+  packets is delivered to the application layer from the base of the
+  receive window. This field is not used with the sending window buffer.
+
+- ack: one if this packet has been acknowledged, zero if not. This is
+  set when a data packet is sent and updated when a matching
+  acknowledgement has been received. If the packet has not been
+  acknowledged when the timeout expires, it will be re-sent. This field
+  is not used with the receive window buffer.
+
+- timestamp: tracks the time when this packet was last sent to the
+  receiver. If this packet has not been acknowledged by the timeout
+  time, it should be resent. This field is not used with the receive
+  window buffer.
+
+- p: This is used to save the sent packet for re-transmission (send
+  buffer) or for storing out-of-order packet in the receive buffer.
+
+Requirements
+
+Your implementation must adhere to the following requirements:
+
+- Data output by the receiver must be identical to that sent by the
+  sender — irrespective of packet loss, congestion, or corruption at the
+  UDP (network) layer. You must ensure reliable transport through
+  acknowledgment packets sent to the sender. The sender should detect
+  missing acknowledgements and/or dropped or corrupted packets.
+
+- Connection teardown should be handled appropriately. When an EOF is
+  read from the application-side, you should send a zero-length payload
+  (12-byte) packet to the receiver to indicate EOF. When an EOF is
+  received, you should call conn_output() with a length of 0 bytes.
+
+- You must support a window size larger than 1. The window size is
+  specified by using the -w command-line option (e.g. -w 5 specifies
+  both a sender and receiver size of 5 packets.
+
+- Acknowledgements are cumulative, rather than selective. You should
+  acknowledge the next packet you are expecting to receive (i.e. 1 more
+  than the largest in-order sequence number that you have received).
+
+- The sender should resend packets if the receiver does not acknowledge
+  it within the timeout period. Retransmission is valid at anytime a
+  packet remains unacknowledged after the timeout period. The default is
+  2000ms (2 sec), but may be changed with the -t option to the program.
+
+- Packets may be retransmitted an infinite number of times, but must
+  retransmits must be attempted at least 5 times. You should call
+  rdt_destroy() to destroy and close the connection if you give up on
+  re-sending.
+
+- Debugging should be done by directing error/debugging messages to
+  standard error instead of standard output. To do this, use
+  fprintf(stderr, "...") instead of the typical printf() calls, which
+  write to standard output.
+
+Functional Implementation
+
+You need to implement six functions in reliable.c to complete this lab.
+These descriptions have changed from the previous assignment. You are
+free to write additional functions, but you must provide implementations
+for the following functions:
+
+- rdt_create(): In reliable.c, the reliable_state structure is intended
+  to capture the state needed to provide reliable transport services for
+  the connection. You will need to add additional fields to this
+  structure. These new fields should be initialized in this function.
+  This function will be called only once per connection and will be
+  called by the driver code in rlib.c. You should save the timeout value
+  from the cc structure here.
+
+- rdt_destroy(): This function will be called when the remote end of the
+  connection has terminated. You should manually call rdt_destroy()
+  when:
+
+  - An EOF has been read from the remote process (i.e. a zero-length
+    payload)
+
+  - An EOF has been read from the application layer input ( conn_input()
+    returns -1)
+
+    AND:
+
+  - All packets have been acknowledged.
+
+    AND:
+
+  - All output data has been written to the application with
+     conn_output().
+
+- rdt_recvpkt(): When a new packet is received by the network layer, it
+  will call rdt_recvpkt(). You should handle both data packets and ack
+  packets here. When a data packet is received, it should be placed into
+  the appropriate spot in the receive buffer, and the receiver window
+  metadata updated. To deliver the data to the application layer, call
+  rdt_output().
+
+  When receiving an ack packet, update the sender window. If you update
+  the base of the sender window, you should call rdt_read() to read more
+  data from the application layer to send (if any is available).
+
+- rdt_read(): This function may be called by the system when there is
+  data ready from the application-layer or if sends have been
+  acknowledged and there is free space in the send buffer. This function
+  is called when data is ready to be read and sent to the receiver. You
+  should repeatedly call conn_input() until it returns 0 or there are no
+  additional buffers in the send window. When you read data from
+   conn_input(), place it into a packet, save a copy in the next free
+  spot in the send buffer, and deliver it to the receiver using
+   conn_sendpkt().
+
+- rdt_output(): This function is called whenever a data packet has been
+  recieved (in rdt_recvpkt()), or the application-layer buffer has
+  changed and more space is available to deliver received data. You
+  should call conn_bufspace() to check that sufficient room exists
+  before you call conn_output() to deliver the packet to the
+  application-layer.
+
+  Once you have delivered as much received data as you can, you should
+  send a cumulative acknowledgement for all delivered data and adjust
+  the receive window as needed.
+
+- rdt_timer(): This function is called repeatedly whenever the poll
+  timer expires, set to be 1/5 the rate of a retransmission interval, or
+  about 400 ms. You should not retransmit every unacknowledged packet
+  when the this function is called. You must ensure that the required
+  timeout has occurred prior to retransmission and that any sent packets
+  have not been previously acknowledged.
+
+Compiling and Running
+
+To make things simpler for building your program, there is a Makefile
+included with the skeleton code. To build the reliable transport server
+type: $ make.
+
+There are also reference implementations that you can use for testing.
+The skeleton code takes four options that can change the behavior of the
+program. The -d option enables some limited debug messages, which may be
+useful during development and the -l option will enable some rudimentary
+logging. The -t option specifies the timeout value in milliseconds. The
+-w option specifies the size of both the send and receive windows.
+
+Testing
+
+You should start by testing your implementation using connections over
+the loopback interface, which has a hostname of localhost and an IP
+address of 127.0.0.1. The loopback interface is reliable, so you won’t
+see corruption or packet loss.
+
+The cs-testing virtual server is configured with a network interface
+that has been configured to lose 5% of the packets sent to it. You
+should use this virtual host to test the reliability properties of your
+implementation.
+
+To use this machine, login to the cs-testing server and start your
+program, specifying the port to listen on and the hostname/port
+combination that will be connecting. By default, both TCP and UDP
+servers will listen on all interfaces on a given host. The bind() system
+call can be used to only listen on a specific interface, but by default
+it will listen on all interfaces (incl. localhost). We can use this to
+our advantage since the testing interfaces will also be listining for
+traffic to your implementation.
+
+On the other host (i.e. cslogin), run your program, but use the
+ cs-testing-testnet interface (for example) to test with packet loss.
+
+You should start by testing your implementation using connections over
+the loopback interface, which has a hostname of localhost and an IP
+address of 127.0.0.1. The loopback interface is reliable, so you won’t
+see corruption or packet loss. You may use any port numbers that are not
+in use by other students.
+
+Sample Output
+
+To run your implementation or use the reference implementations, the
+program invocations, and output should look as follows:
+
+Start by running the receiving process. This invocation listens on UDP
+port 11000, and expects to talk to a peer at 127.0.0.1, port 12000.
+
+           $ ./reliable 11000 localhost:12000
+           [listening on UDP port 11000]
+           Hello from sender!
+
+To run the sender, we use the opposite syntax:
+
+           $ ./reliable 12000 localhost:11000
+           [listening on UDP port 11000]
+           Hello from sender!
+           ^D
+           $
+
+Testing with the lossy interface:
+
+           cs-testing$ ./reliable 11000 cs-testing-testnet:12000
+           [listening on UDP port 11000]
+           Hello from sender!
+
+To run the sender, we use the opposite syntax:
+
+           cs-testing$ ./reliable 12000 cs-testing:11000
+           [listening on UDP port 11000]
+           Hello from sender!
+           ^D
+           $
