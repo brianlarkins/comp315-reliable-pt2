@@ -18,10 +18,13 @@
 #define DATA_HDRLEN 12
 #define ACK_HDRLEN   8
 
-#define TERM_REMOTE_EOF 8
-#define TERM_LOCAL_EOF  4
-#define TERM_ALL_ACKS   2
-#define TERM_ALL_OUT    1
+/* If a single packet has been retransmitted this many times with no ack,
+ * give up and tear down the connection. Spec floor is ≥5; 10 leaves
+ * plenty of margin while still bounding the dead-peer wait. */
+#define MAX_RETRIES 10
+
+#define TERM_REMOTE_EOF 2
+#define TERM_LOCAL_EOF  1
 
 /*
  * sender/receiver window buffer information
@@ -30,6 +33,7 @@ struct window_buf_s {
   uint32_t        len;       // packet length
   uint32_t        valid;     // this buffer contains a received packet (recv-only)
   uint32_t        ack;       // this buffer has been acknowledeged by receiver (send-only)
+  uint32_t        retries;   // number of times this packet has been retransmitted (send-only)
   uint64_t        timestamp; // when this packet was sent (send-only)
   packet_t        p;         // buffered packet
 };
@@ -178,9 +182,6 @@ rdt_t *rdt_create(conn_t *c, const struct sockaddr_storage *ss, const struct con
   r->sbidx = 0;
   r->slen  = 0;
 
-  r->tstatus |= TERM_ALL_OUT;
-  r->tstatus |= TERM_ALL_ACKS;
-
   return r;
 }
 
@@ -190,21 +191,29 @@ rdt_t *rdt_create(conn_t *c, const struct sockaddr_storage *ss, const struct con
  * rdt_destroy - shutdown a reliable protocol session
  * @param r - reliable connection to close
  */
+/* Are we ready to graceful-shutdown? Both EOFs delivered and no pending
+ * data either direction. Used to gate our own internal calls to
+ * rdt_destroy; the library may also call rdt_destroy directly (e.g. on
+ * ICMP port-unreachable), and in that case the teardown is unconditional. */
+static int destroy_ready(rdt_t *r) {
+  uint32_t both_eof = TERM_LOCAL_EOF | TERM_REMOTE_EOF;
+  return r && r->c
+      && (r->tstatus & both_eof) == both_eof
+      && r->slen == 0 && r->rlen == 0;
+}
+
 void rdt_destroy(rdt_t *r) {
+  if (!r || !r->c) return;  // already torn down
 
-  if (r->tstatus & (TERM_LOCAL_EOF|TERM_REMOTE_EOF)) {
-    if ((r->tstatus & TERM_ALL_OUT) && (r->tstatus & TERM_ALL_ACKS)) {
+  if (r->next)
+    r->next->prev = r->prev;
+  *r->prev = r->next;
+  conn_destroy (r->c);
+  r->c = NULL;
 
-      if (r->next)
-        r->next->prev = r->prev;
-      *r->prev = r->next;
-      conn_destroy (r->c);
-
-      /* Free any other allocated memory here */
-      free(r->rwin);
-      free(r->swin);
-    }
-  }
+  free(r->rwin);
+  free(r->swin);
+  free(r);
 }
 
 
@@ -247,30 +256,32 @@ static void rdt_recvpkt_inner(rdt_t *r, packet_t *pkt, size_t n) {
   if (opt_debug)
     fprintf(stderr, "rdt_recvpkt:  received packet of %zd bytes\n", n);
 
-  // don't accept damaged goods
+  // damaged or malformed packet
   if (cksum(pkt, n) != 0xffff)
+    goto done;
+  if (n < ACK_HDRLEN || n != ntohs(pkt->len))
     goto done;
 
   // is packet data or ack?
-  if ((n > ACK_HDRLEN) && (n <= sizeof(packet_t))) {
-    // if packet is data:
-    //   - check to see if its seq# is in range of rbase + winsize
-    //     drop if not
-    //   - is packet EOF?
-    //     - if so, then update termination status and attempt to quit
-    //   - recieve packet into recv buffer
-    //   - call rdt_output() to output packets
+  if ((n >= DATA_HDRLEN) && (n <= sizeof(packet_t))) {
+    // data packet (zero-length payload signals EOF; handled like any data
+    // packet — stored in the receive window and delivered+acked by rdt_output)
     if (opt_debug)
       fprintf(stderr, "rcvdata: seqno: %d last: %d\n", ntohl(pkt->seqno), r->rbase);
 
-    // check for EOF
-    if (n == DATA_HDRLEN) {
-      r->tstatus |= TERM_REMOTE_EOF;
-      rdt_destroy(r); // not quite - need to do union, not intersection of events
+    seqno = ntohl(pkt->seqno);
+
+    // already-delivered duplicate: re-send the latest cumulative ack so the
+    // sender stops retransmitting a packet whose original ack was lost.
+    if (seqno < r->rbase) {
+      packet_t ackp;
+      memset(&ackp, 0, sizeof(ackp));
+      ackp.len   = htons(ACK_HDRLEN);
+      ackp.ackno = htonl(r->rbase);
+      ackp.cksum = cksum(&ackp, ACK_HDRLEN);
+      netfx_send(r->c, &ackp, ACK_HDRLEN);
       goto done;
     }
-
-    seqno = ntohl(pkt->seqno);
 
     // check to ensure that packet is within our receive window
     if ((seqno >= r->rbase) && (seqno < (r->rbase  + r->winsize))) {
@@ -283,10 +294,14 @@ static void rdt_recvpkt_inner(rdt_t *r, packet_t *pkt, size_t n) {
         fprintf(stderr, "receiving %d winseq: %d windex: %d\n", seqno, winseq, windex);
       }
 
+      // only count this slot once — a duplicate of a buffered out-of-order
+      // packet must not double-bump rlen, or rlen never returns to 0 and
+      // the teardown condition (rlen == 0) is unreachable.
+      if (!r->rwin[windex].valid)
+        r->rlen++;
       r->rwin[windex].len   = n;
       r->rwin[windex].valid = 1;
       r->rwin[windex].p     = *pkt;
-      r->rlen++;
 
       rdt_output(r); // handles outputting to application-layer + ack sending
 
@@ -308,15 +323,12 @@ static void rdt_recvpkt_inner(rdt_t *r, packet_t *pkt, size_t n) {
     }
     if ((ackno > r->sbase) && (ackno <= (r->sbase + r->slen))) {
 
-      int winseq = (ackno-1) - r->sbase;   // find where in the window this packet goes
-      int windex = (r->sbidx + winseq) % r->winsize;  // calculate index in window
-
-      if (opt_debug) {
-        fprintf(stderr, "receiving ack: %d winseq: %d windex: %d\n", ackno, winseq, windex);
+      // ack is cumulative: every packet up to ackno-1 is acknowledged.
+      uint32_t n_acked = ackno - r->sbase;
+      for (uint32_t k = 0; k < n_acked; k++) {
+        int idx = (r->sbidx + k) % r->winsize;
+        r->swin[idx].ack = 1;
       }
-
-      // mark packet as acknowledged
-      r->swin[windex].ack = 1;
 
       // update sender window
       uint32_t len = r->slen;
@@ -337,6 +349,10 @@ static void rdt_recvpkt_inner(rdt_t *r, packet_t *pkt, size_t n) {
       // if we reclaimed send window space and more app-layer data remains
       if ((len != r->slen) && (r->swinfull))
         rdt_read(r);
+
+      // last ack of our EOF may have just arrived; check teardown.
+      if (destroy_ready(r))
+        rdt_destroy(r);
 
     } else {
       // ack # outside send window
@@ -363,8 +379,13 @@ void rdt_read(rdt_t *r) {
   uint32_t nfree, nextidx;
   int rc = 0, len = 0;
 
-  nfree   = r->winsize - r->slen;
-  nextidx = (r->sbidx + r->slen) % r->winsize;
+  // once we've signaled local EOF, never send anything more — stdin POLLHUP
+  // keeps firing on EOF, which would otherwise re-trigger rdt_read and
+  // queue duplicate EOF packets at successive seqnos.
+  if (r->tstatus & TERM_LOCAL_EOF)
+    return;
+
+  nfree = r->winsize - r->slen;
 
   if (!nfree) {
     r->swinfull = 1;
@@ -378,6 +399,7 @@ void rdt_read(rdt_t *r) {
 
   // only attempt to read as much data as we have room in send window
   for (uint32_t i=0; i < nfree; i++) {
+    nextidx = (r->sbidx + r->slen) % r->winsize;       // advances as slen grows
     memset(&r->swin[nextidx], 0, sizeof(window_buf_t)); // zero-out window buffer
 
     rc = conn_input(r->c, &(r->swin[nextidx].p.data), sizeof(r->swin[nextidx].p.data));
@@ -414,12 +436,13 @@ void rdt_read(rdt_t *r) {
     // send packet on wire
     rc = netfx_send(r->c, &r->swin[nextidx].p, DATA_HDRLEN + len);
     if (rc < 0) {
-      fprintf(stderr,"rdt_read: sendpkt");
+      perror("rdt_read: sendpkt");
     }
 
     // shutdown if EOF case
     if (!len) {
-      rdt_destroy(r);
+      if (destroy_ready(r))
+        rdt_destroy(r);
       break;
     }
   }
@@ -462,6 +485,10 @@ void rdt_output(rdt_t *r) {
     if (rc != payload_size)
       fprintf(stderr, "rdt_output: conn_output returned %d for write of %d bytes\n", rc, payload_size);
 
+    // a zero-length payload signals EOF from the remote side
+    if (payload_size == 0)
+      r->tstatus |= TERM_REMOTE_EOF;
+
     r->rwin[nextidx].valid = 0;
     r->rlen--;
     r->rbidx = (r->rbidx + 1) % r->winsize;
@@ -488,10 +515,8 @@ void rdt_output(rdt_t *r) {
     }
   }
 
-  if (ndelivered == nfull) {
-    r->tstatus |= TERM_ALL_OUT;
-    rdt_destroy(r); // only terminates if everything else is over
-  }
+  if (destroy_ready(r))
+    rdt_destroy(r);
 }
 
 
@@ -501,7 +526,7 @@ void rdt_output(rdt_t *r) {
  */
 void rdt_timer() {
   struct timespec ts;
-  rdt_t  *rconn = rdt_list;
+  rdt_t  *rconn, *rnext;
   uint64_t now;
   uint32_t nextidx, npending, base, i;
   int rc = 0;
@@ -509,8 +534,8 @@ void rdt_timer() {
   clock_gettime (CLOCK_MONOTONIC, &ts);
   now = (1000 * ts.tv_sec) + (ts.tv_nsec / 1000000);
 
-  for (rconn = rdt_list; rconn; rconn = rconn->next) {
-
+  for (rconn = rdt_list; rconn; rconn = rnext) {
+    rnext    = rconn->next;
     npending = rconn->slen;
     base     = rconn->sbidx;
 
@@ -524,9 +549,26 @@ void rdt_timer() {
           fprintf(stderr, "rdt_timer: retransmitting: ack: %d index: %d\n",
               rconn->swin[nextidx].ack, nextidx);
         rc = netfx_send(rconn->c, &rconn->swin[nextidx].p, rconn->swin[nextidx].len);
-        if (rc < 0)
-          fprintf(stderr, "rdt_timer: retransmit\n");
+        if (rc < 0) {
+          int saved = errno;
+          perror("rdt_timer: retransmit");
+          if (saved == ECONNREFUSED) {
+            // peer is gone (UDP port closed). Stop retransmitting forever
+            // and tear down this connection.
+            fprintf(stderr, "rdt_timer: peer unreachable, tearing down\n");
+            rdt_destroy(rconn);
+            break;  // rconn freed; skip remaining inner iterations
+          }
+        }
         rconn->swin[nextidx].timestamp = now;
+        rconn->swin[nextidx].retries++;
+        if (rconn->swin[nextidx].retries > MAX_RETRIES) {
+          // peer has been unresponsive too long — give up.
+          fprintf(stderr, "rdt_timer: %u retries on seqno=%u, giving up\n",
+                  rconn->swin[nextidx].retries, ntohl(rconn->swin[nextidx].p.seqno));
+          rdt_destroy(rconn);
+          break;  // rconn freed
+        }
       }
     }
   }
