@@ -18,10 +18,11 @@
 #define DATA_HDRLEN 12
 #define ACK_HDRLEN   8
 
-/* If a single packet has been retransmitted this many times with no ack,
- * give up and tear down the connection. Spec floor is ≥5; 10 leaves
- * plenty of margin while still bounding the dead-peer wait. */
-#define MAX_RETRIES 10
+/* If we retransmit for this many consecutive timer rounds without receiving
+ * a single packet from the peer, treat the peer as dead and tear down. The
+ * counter resets on any packet received, so a merely lossy (but live) link
+ * never trips it -- only genuine peer death does. */
+#define MAX_STALL_ROUNDS 12
 
 #define TERM_REMOTE_EOF 2
 #define TERM_LOCAL_EOF  1
@@ -33,7 +34,6 @@ struct window_buf_s {
   uint32_t        len;       // packet length
   uint32_t        valid;     // this buffer contains a received packet (recv-only)
   uint32_t        ack;       // this buffer has been acknowledeged by receiver (send-only)
-  uint32_t        retries;   // number of times this packet has been retransmitted (send-only)
   uint64_t        timestamp; // when this packet was sent (send-only)
   packet_t        p;         // buffered packet
 };
@@ -63,6 +63,7 @@ struct reliable_state {
 
   uint32_t        swinfull;  // sender window was full, but app-level data remains
   uint32_t        tstatus;   // termination status
+  uint32_t        stalled;   // consecutive retransmit rounds with no packet received
 };
 
 
@@ -261,6 +262,9 @@ static void rdt_recvpkt_inner(rdt_t *r, packet_t *pkt, size_t n) {
     goto done;
   if (n < ACK_HDRLEN || n != ntohs(pkt->len))
     goto done;
+
+  // a valid packet proves the peer is alive — reset the stall counter
+  r->stalled = 0;
 
   // is packet data or ack?
   if ((n >= DATA_HDRLEN) && (n <= sizeof(packet_t))) {
@@ -539,6 +543,8 @@ void rdt_timer() {
     npending = rconn->slen;
     base     = rconn->sbidx;
 
+    int retransmitted = 0;  // 1 = sent something, -1 = peer gone (rconn freed)
+
     // loop over all unack'd packets in the sender window
     for (i=0; i < npending; i++) {
       nextidx = (base + i) % rconn->winsize;
@@ -557,18 +563,23 @@ void rdt_timer() {
             // and tear down this connection.
             fprintf(stderr, "rdt_timer: peer unreachable, tearing down\n");
             rdt_destroy(rconn);
+            retransmitted = -1;
             break;  // rconn freed; skip remaining inner iterations
           }
         }
         rconn->swin[nextidx].timestamp = now;
-        rconn->swin[nextidx].retries++;
-        if (rconn->swin[nextidx].retries > MAX_RETRIES) {
-          // peer has been unresponsive too long — give up.
-          fprintf(stderr, "rdt_timer: %u retries on seqno=%u, giving up\n",
-                  rconn->swin[nextidx].retries, ntohl(rconn->swin[nextidx].p.seqno));
-          rdt_destroy(rconn);
-          break;  // rconn freed
-        }
+        retransmitted = 1;
+      }
+    }
+
+    // a round in which we retransmitted but heard nothing back counts as a
+    // stall; rdt_recvpkt resets ->stalled whenever a packet arrives.
+    if (retransmitted == 1) {
+      rconn->stalled++;
+      if (rconn->stalled > MAX_STALL_ROUNDS) {
+        fprintf(stderr, "rdt_timer: peer unresponsive for %u rounds, giving up\n",
+                rconn->stalled);
+        rdt_destroy(rconn);
       }
     }
   }
